@@ -914,3 +914,171 @@ test("validates local check artifacts through the CLI", { skip: !HAS_SAFE_INPUT_
   assert.match(schemaOnlyOutput, /PASS: 1 coverage units valid/);
 });
 
+test("validates local check artifact edge cases", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "artifact-edge-cases-"));
+  try {
+    const hunterArtifacts = path.join(directory, "agents", "hunter-1", "artifacts");
+    fs.mkdirSync(hunterArtifacts, { recursive: true });
+
+    // 1. 0-byte empty regular file is valid
+    const emptyFile = path.join(hunterArtifacts, "empty.txt");
+    fs.writeFileSync(emptyFile, "");
+    const emptyUnit = unit({
+      status: "covered",
+      agent_id: "hunter-1",
+      reviewed_paths: ["src/router.ts"],
+      local_checks: [localCheck("hunter-1", { artifact: "agents/hunter-1/artifacts/empty.txt" })],
+    });
+    assert.deepEqual(errorsFor([emptyUnit], { baseDir: directory }), []);
+
+    // 2. Deeply nested file inside artifacts directory is valid
+    const deepDir = path.join(hunterArtifacts, "level1", "level2", "level3");
+    fs.mkdirSync(deepDir, { recursive: true });
+    const deepFile = path.join(deepDir, "deep.log");
+    fs.writeFileSync(deepFile, "deep log content");
+    const deepUnit = unit({
+      status: "covered",
+      agent_id: "hunter-1",
+      reviewed_paths: ["src/router.ts"],
+      local_checks: [localCheck("hunter-1", { artifact: "agents/hunter-1/artifacts/level1/level2/level3/deep.log" })],
+    });
+    assert.deepEqual(errorsFor([deepUnit], { baseDir: directory }), []);
+
+    // 3. Valid Unicode (NFC normalized) artifact filename
+    const unicodeFile = path.join(hunterArtifacts, "caf\u00e9.txt");
+    fs.writeFileSync(unicodeFile, "caf\u00e9 report");
+    const unicodeUnit = unit({
+      status: "covered",
+      agent_id: "hunter-1",
+      reviewed_paths: ["src/router.ts"],
+      local_checks: [localCheck("hunter-1", { artifact: "agents/hunter-1/artifacts/caf\u00e9.txt" })],
+    });
+    assert.deepEqual(errorsFor([unicodeUnit], { baseDir: directory }), []);
+
+    // 4. Multiple checks in one unit: check 0 source, check 1 valid local, check 2 missing local
+    const presentFile = path.join(hunterArtifacts, "present.txt");
+    fs.writeFileSync(presentFile, "evidence");
+    const mixedChecksUnit = unit({
+      status: "covered",
+      agent_id: "hunter-1",
+      reviewed_paths: ["src/router.ts", "src/authz.ts", "src/user.ts"],
+      local_checks: [
+        sourceCheck("hunter-1", { reviewed_paths: ["src/router.ts"] }),
+        localCheck("hunter-1", { reviewed_paths: ["src/authz.ts"], artifact: "agents/hunter-1/artifacts/present.txt" }),
+        localCheck("hunter-1", { reviewed_paths: ["src/user.ts"], artifact: "agents/hunter-1/artifacts/missing-third.txt" }),
+      ],
+    });
+    const mixedErrors = errorsFor([mixedChecksUnit], { baseDir: directory });
+    assert.equal(mixedErrors.length, 1);
+    assert.equal(mixedErrors[0], "$[0].local_checks[2].artifact: local check artifact does not exist");
+
+    // 5. Blocked and candidate units also validate artifact on disk
+    const blockedUnit = unit({
+      status: "blocked",
+      agent_id: "hunter-1",
+      reviewed_paths: ["src/router.ts"],
+      local_checks: [localCheck("hunter-1", { artifact: "agents/hunter-1/artifacts/missing-blocked.txt" })],
+      unresolved: ["Deployment configuration is unavailable."],
+    });
+    const blockedErrors = errorsFor([blockedUnit], { baseDir: directory });
+    assert(blockedErrors.some((e) => e === "$[0].local_checks[0].artifact: local check artifact does not exist"));
+
+    const candidateUnit = unit({
+      status: "candidate",
+      agent_id: "hunter-1",
+      reviewed_paths: ["src/router.ts"],
+      local_checks: [localCheck("hunter-1", { artifact: "agents/hunter-1/artifacts/missing-candidate.txt" })],
+      result_fingerprints: ["router-authz-bypass"],
+      unresolved: ["validation_budget_exhausted"],
+    });
+    const candidateErrors = errorsFor([candidateUnit], { baseDir: directory });
+    assert(candidateErrors.some((e) => e === "$[0].local_checks[0].artifact: local check artifact does not exist"));
+
+    // 6. Multiple units in one ledger: error points at specific unit index
+    const unit0 = unit({
+      coverage_id: canonicalCoverageId({
+        surface: "src/router.ts#GET /users",
+        boundary: "src/authz.ts#requireViewer",
+        subsystem: "packages/api",
+        attack_class: "ATTACK-CLASSES.md#Access control",
+      }),
+      canonical_refs: {
+        surface: "src/router.ts#GET /users",
+        boundary: "src/authz.ts#requireViewer",
+        subsystem: "packages/api",
+        attack_class: "ATTACK-CLASSES.md#Access control",
+      },
+      surface: "List-users route",
+      boundary: "Viewer permission",
+      status: "covered",
+      agent_id: "hunter-1",
+      reviewed_paths: ["src/router.ts"],
+      local_checks: [localCheck("hunter-1", { artifact: "agents/hunter-1/artifacts/present.txt" })],
+    });
+    const unit1 = unit({
+      coverage_id: canonicalCoverageId({
+        surface: "src/router.ts#POST /users",
+        boundary: "src/authz.ts#requireAdmin",
+        subsystem: "packages/api",
+        attack_class: "ATTACK-CLASSES.md#Access control",
+      }),
+      canonical_refs: {
+        surface: "src/router.ts#POST /users",
+        boundary: "src/authz.ts#requireAdmin",
+        subsystem: "packages/api",
+        attack_class: "ATTACK-CLASSES.md#Access control",
+      },
+      surface: "Create-user route",
+      boundary: "Admin permission",
+      status: "covered",
+      agent_id: "hunter-1",
+      reviewed_paths: ["src/router.ts"],
+      local_checks: [localCheck("hunter-1", { artifact: "agents/hunter-1/artifacts/missing-in-unit1.txt" })],
+    });
+    const sortedLedger = [unit0, unit1].sort((a, b) => a.coverage_id.localeCompare(b.coverage_id));
+    const badIndex = sortedLedger.indexOf(unit1);
+    const multiErrors = errorsFor(sortedLedger, { baseDir: directory });
+    assert.equal(multiErrors.length, 1);
+    assert.equal(multiErrors[0], `$[${badIndex}].local_checks[0].artifact: local check artifact does not exist`);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("CLI accepts --base-dir and --output-dir with equals syntax", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
+  const customDir = fs.mkdtempSync(path.join(os.tmpdir(), "custom-cli-flags-"));
+  try {
+    const artDir = path.join(customDir, "agents", "hunter-1", "artifacts");
+    fs.mkdirSync(artDir, { recursive: true });
+    fs.writeFileSync(path.join(artDir, "result.txt"), "valid content");
+
+    const validUnit = unit({
+      status: "covered",
+      agent_id: "hunter-1",
+      reviewed_paths: ["src/router.ts"],
+      local_checks: [localCheck("hunter-1", { artifact: "agents/hunter-1/artifacts/result.txt" })],
+    });
+
+    // 1. --base-dir <dir>
+    const baseDirRes = runCli(JSON.stringify([validUnit]), {
+      args: ["<ledger>", "--base-dir", customDir],
+    });
+    assert.equal(baseDirRes.status, 0, cliOutput(baseDirRes));
+
+    // 2. --output-dir=<dir>
+    const outputDirEqRes = runCli(JSON.stringify([validUnit]), {
+      args: ["<ledger>", `--output-dir=${customDir}`],
+    });
+    assert.equal(outputDirEqRes.status, 0, cliOutput(outputDirEqRes));
+
+    // 3. --base-dir=<dir>
+    const baseDirEqRes = runCli(JSON.stringify([validUnit]), {
+      args: ["<ledger>", `--base-dir=${customDir}`],
+    });
+    assert.equal(baseDirEqRes.status, 0, cliOutput(baseDirEqRes));
+  } finally {
+    fs.rmSync(customDir, { recursive: true, force: true });
+  }
+});
+
+
