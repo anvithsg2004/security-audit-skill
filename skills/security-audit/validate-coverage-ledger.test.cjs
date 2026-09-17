@@ -53,17 +53,19 @@ function unit(overrides = {}) {
   return Object.assign(value, overrides, { canonical_refs: canonicalRefs });
 }
 
-function errorsFor(value) {
-  return validateDocument(value);
+function errorsFor(value, options) {
+  return validateDocument(value, options);
 }
 
 function runCli(contents, options = {}) {
-  const { nodeArgs = [], timeout = CLI_TIMEOUT_MS } = options;
+  const { nodeArgs = [], timeout = CLI_TIMEOUT_MS, args = [], setup } = options;
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "validate-coverage-ledger-"));
   const ledgerPath = path.join(directory, "coverage-ledger.json");
   try {
     fs.writeFileSync(ledgerPath, contents);
-    return spawnSync(process.execPath, [...nodeArgs, validatorPath, ledgerPath], {
+    if (typeof setup === "function") setup(directory);
+    const cliArgs = args.length > 0 ? args.map((a) => (a === "<ledger>" ? ledgerPath : a)) : [ledgerPath];
+    return spawnSync(process.execPath, [...nodeArgs, validatorPath, ...cliArgs], {
       encoding: "utf8",
       timeout,
     });
@@ -738,3 +740,177 @@ test("accepts a canonical ID derived from near-maximum multibyte references", ()
     assert.equal(result.status, 0, cliOutput(result));
   }
 });
+
+test("validates local check artifact existence and properties on disk", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "artifact-test-"));
+  try {
+    const hunterArtifacts = path.join(directory, "agents", "hunter-1", "artifacts");
+    fs.mkdirSync(hunterArtifacts, { recursive: true });
+
+    // 1. Nonexistent artifact
+    const missing = unit({
+      status: "covered",
+      agent_id: "hunter-1",
+      reviewed_paths: ["src/router.ts"],
+      local_checks: [localCheck("hunter-1", { artifact: "agents/hunter-1/artifacts/missing.txt" })],
+    });
+    const missingErrors = errorsFor([missing], { baseDir: directory });
+    assert(missingErrors.some((e) => e.includes("$[0].local_checks[0].artifact: local check artifact does not exist")));
+
+    // 2. Valid regular file
+    const validFile = path.join(hunterArtifacts, "result.txt");
+    fs.writeFileSync(validFile, "local test output");
+    const valid = unit({
+      status: "covered",
+      agent_id: "hunter-1",
+      reviewed_paths: ["src/router.ts"],
+      local_checks: [localCheck("hunter-1", { artifact: "agents/hunter-1/artifacts/result.txt" })],
+    });
+    assert.deepEqual(errorsFor([valid], { baseDir: directory }), []);
+
+    // 3. Directory artifact
+    const subDir = path.join(hunterArtifacts, "sub-dir");
+    fs.mkdirSync(subDir, { recursive: true });
+    const dirUnit = unit({
+      status: "covered",
+      agent_id: "hunter-1",
+      reviewed_paths: ["src/router.ts"],
+      local_checks: [localCheck("hunter-1", { artifact: "agents/hunter-1/artifacts/sub-dir" })],
+    });
+    const dirErrors = errorsFor([dirUnit], { baseDir: directory });
+    assert(dirErrors.some((e) => e.includes("$[0].local_checks[0].artifact: local check artifact must be a regular file")));
+
+    // 4. Symlink artifact (if supported on host)
+    let canSymlink = false;
+    const symlinkPath = path.join(hunterArtifacts, "symlink.txt");
+    try {
+      fs.symlinkSync(validFile, symlinkPath);
+      canSymlink = true;
+    } catch {
+      // Symlinks may require elevated privileges on Windows
+    }
+    if (canSymlink) {
+      const symlinkUnit = unit({
+        status: "covered",
+        agent_id: "hunter-1",
+        reviewed_paths: ["src/router.ts"],
+        local_checks: [localCheck("hunter-1", { artifact: "agents/hunter-1/artifacts/symlink.txt" })],
+      });
+      const symErrors = errorsFor([symlinkUnit], { baseDir: directory });
+      assert(symErrors.some((e) => e.includes("$[0].local_checks[0].artifact: local check artifact must not be a symlink")));
+      fs.unlinkSync(symlinkPath);
+    }
+
+    // 5. Escaping agent artifacts directory via directory symlink
+    if (canSymlink) {
+      const outsideDir = path.join(directory, "outside");
+      fs.mkdirSync(outsideDir, { recursive: true });
+      fs.writeFileSync(path.join(outsideDir, "outside.txt"), "outside content");
+      const symDir = path.join(hunterArtifacts, "escaped");
+      try {
+        fs.symlinkSync(outsideDir, symDir, "dir");
+        const escapeUnit = unit({
+          status: "covered",
+          agent_id: "hunter-1",
+          reviewed_paths: ["src/router.ts"],
+          local_checks: [localCheck("hunter-1", { artifact: "agents/hunter-1/artifacts/escaped/outside.txt" })],
+        });
+        const escapeErrors = errorsFor([escapeUnit], { baseDir: directory });
+        assert(escapeErrors.some((e) => e.includes("$[0].local_checks[0].artifact: local check artifact must reside inside agent artifacts directory")));
+      } finally {
+        try { fs.unlinkSync(symDir); } catch {}
+      }
+    }
+
+    // 6. Attempts history also validates artifacts on disk
+    const attemptWithMissing = unit({
+      attempts: [archivedAttempt({
+        local_checks: [localCheck("hunter-1", { artifact: "agents/hunter-1/artifacts/missing-attempt.txt" })],
+      })],
+      wave: 2,
+      status: "covered",
+      agent_id: "hunter-2",
+      reviewed_paths: ["src/router.ts"],
+      local_checks: [sourceCheck("hunter-2")],
+    });
+    const attemptErrors = errorsFor([attemptWithMissing], { baseDir: directory });
+    assert(attemptErrors.some((e) => e.includes("$[0].attempts[0].local_checks[0].artifact: local check artifact does not exist")));
+
+    const attemptValidFile = path.join(hunterArtifacts, "attempt-result.txt");
+    fs.writeFileSync(attemptValidFile, "attempt evidence");
+    const attemptWithValid = unit({
+      attempts: [archivedAttempt({
+        local_checks: [localCheck("hunter-1", { artifact: "agents/hunter-1/artifacts/attempt-result.txt" })],
+      })],
+      wave: 2,
+      status: "covered",
+      agent_id: "hunter-2",
+      reviewed_paths: ["src/router.ts"],
+      local_checks: [sourceCheck("hunter-2")],
+    });
+    assert.deepEqual(errorsFor([attemptWithValid], { baseDir: directory }), []);
+
+    // 7. Schema-only validation ignores disk checks when baseDir is omitted
+    assert.deepEqual(errorsFor([missing]), []);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("validates local check artifacts through the CLI", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
+  // 1. Missing artifact causes CLI to fail
+  const missingUnit = unit({
+    status: "covered",
+    agent_id: "hunter-1",
+    reviewed_paths: ["src/router.ts"],
+    local_checks: [localCheck("hunter-1", { artifact: "agents/hunter-1/artifacts/missing.txt" })],
+  });
+  const failResult = runCli(JSON.stringify([missingUnit]));
+  const failOutput = cliOutput(failResult);
+  assert.equal(failResult.status, 1, failOutput);
+  assert.match(failOutput, /\$\[0\]\.local_checks\[0\]\.artifact: local check artifact does not exist/);
+
+  // 2. Present artifact causes CLI to succeed
+  const presentUnit = unit({
+    status: "covered",
+    agent_id: "hunter-1",
+    reviewed_paths: ["src/router.ts"],
+    local_checks: [localCheck("hunter-1", { artifact: "agents/hunter-1/artifacts/result.txt" })],
+  });
+  const passResult = runCli(JSON.stringify([presentUnit]), {
+    setup(dir) {
+      const artDir = path.join(dir, "agents", "hunter-1", "artifacts");
+      fs.mkdirSync(artDir, { recursive: true });
+      fs.writeFileSync(path.join(artDir, "result.txt"), "retained artifact content");
+    },
+  });
+  const passOutput = cliOutput(passResult);
+  assert.equal(passResult.status, 0, passOutput);
+  assert.match(passOutput, /PASS: 1 coverage units valid/);
+
+  // 3. CLI --output-dir specifies custom base directory
+  const customDir = fs.mkdtempSync(path.join(os.tmpdir(), "custom-out-"));
+  try {
+    const customArtDir = path.join(customDir, "agents", "hunter-1", "artifacts");
+    fs.mkdirSync(customArtDir, { recursive: true });
+    fs.writeFileSync(path.join(customArtDir, "result.txt"), "custom dir artifact");
+
+    const customPassResult = runCli(JSON.stringify([presentUnit]), {
+      args: ["<ledger>", "--output-dir", customDir],
+    });
+    const customPassOutput = cliOutput(customPassResult);
+    assert.equal(customPassResult.status, 0, customPassOutput);
+    assert.match(customPassOutput, /PASS: 1 coverage units valid/);
+  } finally {
+    fs.rmSync(customDir, { recursive: true, force: true });
+  }
+
+  // 4. CLI --schema-only flag bypasses artifact check
+  const schemaOnlyResult = runCli(JSON.stringify([missingUnit]), {
+    args: ["<ledger>", "--schema-only"],
+  });
+  const schemaOnlyOutput = cliOutput(schemaOnlyResult);
+  assert.equal(schemaOnlyResult.status, 0, schemaOnlyOutput);
+  assert.match(schemaOnlyOutput, /PASS: 1 coverage units valid/);
+});
+
