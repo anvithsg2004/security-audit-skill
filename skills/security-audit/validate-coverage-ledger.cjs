@@ -418,7 +418,53 @@ function validateStringArray(value, location, errors, options = {}) {
   });
 }
 
-function validateChecks(value, location, errors) {
+function validateArtifactFile(artifact, agentId, location, errors, baseDir) {
+  const artifactPath = path.resolve(baseDir, artifact);
+  const expectedDir = path.resolve(baseDir, "agents", agentId, "artifacts");
+
+  let stat;
+  try {
+    stat = fs.lstatSync(artifactPath);
+  } catch (error) {
+    if (error && (error.code === "ENOENT" || error.code === "ENOTDIR")) {
+      errors.push(`${location}: local check artifact does not exist`);
+      return;
+    }
+    errors.push(`${location}: cannot access local check artifact: ${error.message}`);
+    return;
+  }
+
+  if (stat.isSymbolicLink()) {
+    errors.push(`${location}: local check artifact must not be a symlink`);
+    return;
+  }
+
+  if (!stat.isFile()) {
+    errors.push(`${location}: local check artifact must be a regular file`);
+    return;
+  }
+
+  try {
+    const realArtifact = fs.realpathSync(artifactPath);
+    let realExpectedDir;
+    try {
+      realExpectedDir = fs.realpathSync(expectedDir);
+    } catch {
+      errors.push(`${location}: local check artifact must reside inside agent artifacts directory`);
+      return;
+    }
+    const relative = path.relative(realExpectedDir, realArtifact);
+    if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
+      errors.push(`${location}: local check artifact must reside inside agent artifacts directory`);
+      return;
+    }
+  } catch {
+    errors.push(`${location}: local check artifact does not exist`);
+    return;
+  }
+}
+
+function validateChecks(value, location, errors, options = {}) {
   if (!Array.isArray(value)) {
     errors.push(`${location}: expected array`);
     return;
@@ -443,6 +489,8 @@ function validateChecks(value, location, errors) {
     } else if (check.method === "local") {
       if (!isOwnedArtifactPath(check.artifact, check.agent_id)) {
         errors.push(`${base}.artifact: local check requires an artifact owned by agent ${safeQuote(isSafeAgentId(check.agent_id) ? check.agent_id : "<agent-id>")}`);
+      } else if (options && typeof options.baseDir === "string" && options.baseDir.length > 0) {
+        validateArtifactFile(check.artifact, check.agent_id, `${base}.artifact`, errors, options.baseDir);
       }
     } else if (check.method !== "source" && check.method !== "local" && check.artifact !== null && !isSafeRelativePath(check.artifact)) {
       errors.push(`${base}.artifact: expected null or a safe output-relative path`);
@@ -565,7 +613,7 @@ function validateStateInvariants(unit, base, errors) {
   }
 }
 
-function validateAttempts(value, unit, base, errors) {
+function validateAttempts(value, unit, base, errors, options = {}) {
   if (!Array.isArray(value)) {
     errors.push(`${base}.attempts: expected array`);
     return;
@@ -605,7 +653,7 @@ function validateAttempts(value, unit, base, errors) {
       hasFreshOwner = true;
     }
     validateStringArray(attempt.reviewed_paths, `${attemptBase}.reviewed_paths`, errors, { pathValue: true });
-    validateChecks(attempt.local_checks, `${attemptBase}.local_checks`, errors);
+    validateChecks(attempt.local_checks, `${attemptBase}.local_checks`, errors, options);
     validateReviewedPathOwnership(attempt, attemptBase, errors);
     validateStringArray(attempt.result_fingerprints, `${attemptBase}.result_fingerprints`, errors, { fingerprint: true });
     validateStringArray(attempt.unresolved, `${attemptBase}.unresolved`, errors);
@@ -643,7 +691,7 @@ function validateAttempts(value, unit, base, errors) {
   }
 }
 
-function collectUnitErrors(unit, index) {
+function collectUnitErrors(unit, index, options = {}) {
   const errors = createErrorList();
   const base = `$[${index}]`;
   if (!isObject(unit)) return [`${base}: expected object`];
@@ -706,9 +754,9 @@ function collectUnitErrors(unit, index) {
   if (!Number.isInteger(unit.wave) || unit.wave < 1) errors.push(`${base}.wave: expected a positive integer`);
   if (unit.agent_id !== null && !isSafeAgentId(unit.agent_id)) errors.push(`${base}.agent_id: expected null or a safe agent ID`);
 
-  validateAttempts(unit.attempts, unit, base, errors);
+  validateAttempts(unit.attempts, unit, base, errors, options);
   validateStringArray(unit.reviewed_paths, `${base}.reviewed_paths`, errors, { pathValue: true });
-  validateChecks(unit.local_checks, `${base}.local_checks`, errors);
+  validateChecks(unit.local_checks, `${base}.local_checks`, errors, options);
   validateReviewedPathOwnership(unit, base, errors);
   validateStringArray(unit.result_fingerprints, `${base}.result_fingerprints`, errors, { fingerprint: true });
   validateStringArray(unit.unresolved, `${base}.unresolved`, errors);
@@ -758,7 +806,8 @@ function readFileWithinLimit(file) {
   }
 }
 
-function validateDocument(ledger) {
+function validateDocument(ledger, options = {}) {
+  const opts = typeof options === "string" ? { baseDir: options } : (options || {});
   const errors = createErrorList();
   if (!Array.isArray(ledger)) {
     errors.push("$: expected a top-level array");
@@ -777,7 +826,7 @@ function validateDocument(ledger) {
   let previousId = null;
   for (let index = 0; index < ledger.length && errors.length < LIMITS.validationErrors; index++) {
     const unit = ledger[index];
-    errors.push(...collectUnitErrors(unit, index));
+    errors.push(...collectUnitErrors(unit, index, opts));
     if (errors.length >= LIMITS.validationErrors) break;
     if (!isObject(unit) || typeof unit.coverage_id !== "string") continue;
 
@@ -805,9 +854,38 @@ function validateDocument(ledger) {
   return errors;
 }
 
-function run(file) {
+function parseArgs(args) {
+  if (typeof args === "string") return { file: args, outputDir: null, schemaOnly: false };
+  if (!Array.isArray(args)) return { file: null, outputDir: null, schemaOnly: false };
+
+  let file = null;
+  let outputDir = null;
+  let schemaOnly = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--output-dir" || arg === "--base-dir") {
+      outputDir = args[++i];
+    } else if (arg.startsWith("--output-dir=")) {
+      outputDir = arg.slice("--output-dir=".length);
+    } else if (arg.startsWith("--base-dir=")) {
+      outputDir = arg.slice("--base-dir=".length);
+    } else if (arg === "--schema-only") {
+      schemaOnly = true;
+    } else if (!arg.startsWith("-") && file === null) {
+      file = arg;
+    }
+  }
+  return { file, outputDir, schemaOnly };
+}
+
+function run(input, options = {}) {
+  const parsed = Array.isArray(input) ? parseArgs(input) : parseArgs([input]);
+  const file = parsed.file;
+  const outputDir = (options && (options.outputDir || options.baseDir)) || parsed.outputDir;
+  const schemaOnly = (options && options.schemaOnly) || parsed.schemaOnly;
+
   if (!file) {
-    console.error("Usage: node validate-coverage-ledger.cjs <path-to-coverage-ledger.json>");
+    console.error("Usage: node validate-coverage-ledger.cjs <path-to-coverage-ledger.json> [--output-dir <run-dir>]");
     return 1;
   }
 
@@ -835,9 +913,11 @@ function run(file) {
     return 1;
   }
 
+  const baseDir = schemaOnly ? null : (outputDir ? path.resolve(outputDir) : path.dirname(path.resolve(file)));
+
   let errors;
   try {
-    errors = validateDocument(ledger);
+    errors = validateDocument(ledger, { baseDir });
   } catch {
     console.error("Failed to validate coverage ledger: unexpected validation error");
     return 1;
@@ -869,4 +949,4 @@ module.exports = {
   validateDocument,
 };
 
-if (require.main === module) process.exit(run(process.argv[2]));
+if (require.main === module) process.exit(run(process.argv.slice(2)));
